@@ -128,17 +128,30 @@ class RGPClient:
             response.raise_for_status()
             return response.text
 
-    def _build_search_url(self, title: str, platform: str) -> str:
+    def _build_search_url(self, title: str, platform: str, region: str = "") -> str:
         """Build search URL for PriceCharting."""
-        # Clean up title for search
-        search_term = f"{title} {platform}"
+        # Clean up title for search, include region for better matching
+        if region:
+            search_term = f"{title} {platform} {region}"
+        else:
+            search_term = f"{title} {platform}"
         search_term = re.sub(r"[^\w\s-]", " ", search_term)
         search_term = " ".join(search_term.split())  # Normalize whitespace
 
         return f"{PRICECHARTING_SEARCH_URL}?q={quote_plus(search_term)}&type=videogames"
 
-    def _map_platform_to_pricecharting(self, platform: str) -> str:
-        """Map platform name to PriceCharting format."""
+    def _map_region_to_pricecharting(self, region: Region) -> str:
+        """Map region enum to PriceCharting search term."""
+        region_map = {
+            Region.PAL: "PAL",
+            Region.NTSC_U: "",  # NTSC-U is the default on PriceCharting (US site)
+            Region.NTSC_J: "JP",  # Japanese versions
+        }
+        return region_map.get(region, "")
+
+    def _map_platform_to_pricecharting(self, platform: str, region: Region = Region.PAL) -> str:
+        """Map platform name to PriceCharting format, considering region."""
+        # Base platform mapping
         platform_map = {
             # Nintendo
             "NES": "NES",
@@ -231,7 +244,7 @@ class RGPClient:
 
         return None
 
-    def _parse_search_results(self, html: str, title: str, platform: str) -> dict | None:
+    def _parse_search_results(self, html: str, title: str, platform: str, region: str = "") -> dict | None:
         """
         Parse PriceCharting search results page to find matching game.
 
@@ -240,8 +253,9 @@ class RGPClient:
         soup = BeautifulSoup(html, "lxml")
         title_lower = title.lower()
         platform_mapped = self._map_platform_to_pricecharting(platform).lower()
+        region_lower = region.lower() if region else ""
 
-        logger.debug(f"Searching for title='{title_lower}', platform='{platform_mapped}'")
+        logger.debug(f"Searching for title='{title_lower}', platform='{platform_mapped}', region='{region_lower}'")
 
         # PriceCharting shows results in a table or list
         # Look for product links
@@ -275,6 +289,22 @@ class RGPClient:
             # Platform matching
             if platform_mapped in parent_text or platform_mapped in href.lower():
                 score += 30
+
+            # Region matching - boost PAL/JP matches if searching for those regions
+            if region_lower:
+                href_lower = href.lower()
+                # PriceCharting uses "pal-" prefix for PAL versions in URLs
+                if region_lower == "pal" and "pal-" in href_lower:
+                    score += 40  # Boost PAL matches
+                    logger.debug(f"  PAL match found in URL: {href}")
+                elif region_lower == "jp" and ("jp-" in href_lower or "japan" in parent_text):
+                    score += 40  # Boost Japanese matches
+                    logger.debug(f"  JP match found: {href}")
+                elif region_lower == "pal" and "pal" in parent_text:
+                    score += 35  # PAL in text is good too
+                elif "pal-" not in href_lower and "jp-" not in href_lower:
+                    # No region prefix = NTSC-U (default), slight penalty if searching for other region
+                    score -= 10
 
             logger.debug(f"  Match candidate: '{link_text}' (score={score}, href={href})")
 
@@ -506,12 +536,16 @@ class RGPClient:
         """
         result = PriceResult(source=PriceSource.RETROGAMEPRICES)
 
-        # Check cache first
+        # Get region string for search
+        region_str = self._map_region_to_pricecharting(item.region)
+
+        # Check cache first (include region in cache key)
         if self.cache:
             cache_key = build_cache_key(
                 platform=item.platform,
                 title=item.title,
                 packaging=item.packaging_state.value,
+                region=item.region.value if item.region else "",
             )
             cached = self.cache.get(CACHE_NS_RGP, cache_key)
             if cached:
@@ -524,24 +558,24 @@ class RGPClient:
                 return result
 
         try:
-            # Map platform name
-            pc_platform = self._map_platform_to_pricecharting(item.platform)
-            logger.info(f"Searching PriceCharting for: {item.title} ({pc_platform})")
+            # Map platform name (considering region)
+            pc_platform = self._map_platform_to_pricecharting(item.platform, item.region)
+            logger.info(f"Searching PriceCharting for: {item.title} ({pc_platform}) [{region_str or 'NTSC-U'}]")
 
-            # Search for the game
-            search_url = self._build_search_url(item.title, pc_platform)
+            # Search for the game (include region in search)
+            search_url = self._build_search_url(item.title, pc_platform, region_str)
             logger.debug(f"Search URL: {search_url}")
 
             search_html = await self._make_request(search_url)
 
-            # Find game in results
-            game_info = self._parse_search_results(search_html, item.title, pc_platform)
+            # Find game in results (include region for better matching)
+            game_info = self._parse_search_results(search_html, item.title, pc_platform, region_str)
 
             if not game_info:
                 result.success = False
                 result.error = "Game not found in search results"
-                result.details = f"PriceCharting: No match for '{item.title}' ({item.platform})\nSearched: {search_url}"
-                logger.warning(f"No match found for {item.title} ({item.platform})")
+                result.details = f"PriceCharting: No match for '{item.title}' ({item.platform}) [{region_str or 'NTSC-U'}]\nSearched: {search_url}"
+                logger.warning(f"No match found for {item.title} ({item.platform}) [{region_str or 'NTSC-U'}]")
                 return result
 
             # Fetch game detail page
@@ -594,12 +628,13 @@ class RGPClient:
 
             logger.info(f"Found prices for {item.title}: {price_description} = ${result.price_eur}" if result.price_eur else f"No price for {item.title}")
 
-            # Cache the result
+            # Cache the result (include region in cache key)
             if self.cache and result.success:
                 cache_key = build_cache_key(
                     platform=item.platform,
                     title=item.title,
                     packaging=item.packaging_state.value,
+                    region=item.region.value if item.region else "",
                 )
                 self.cache.set(
                     CACHE_NS_RGP,
