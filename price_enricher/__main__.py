@@ -35,19 +35,20 @@ def version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.command()
+@app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     # Input/Output
-    input_file: Path = typer.Option(
-        ...,
+    input_file: Optional[Path] = typer.Option(
+        None,
         "--input", "-i",
         help="Input CSV file path (video game collection)",
         exists=True,
         dir_okay=False,
         readable=True,
     ),
-    output_file: Path = typer.Option(
-        ...,
+    output_file: Optional[Path] = typer.Option(
+        None,
         "--output", "-o",
         help="Output CSV file path for enriched data",
         dir_okay=False,
@@ -193,6 +194,18 @@ def main(
     Example:
         price-enricher --input collection.csv --output enriched.csv --default-region PAL
     """
+    # If a subcommand is invoked, skip the main enrichment logic
+    if ctx.invoked_subcommand is not None:
+        return
+
+    # Validate required options for the main enrichment command
+    if input_file is None:
+        console.print("[red]Error:[/red] Missing required option '--input' / '-i'")
+        raise typer.Exit(1)
+    if output_file is None:
+        console.print("[red]Error:[/red] Missing required option '--output' / '-o'")
+        raise typer.Exit(1)
+
     # Validate source option
     if only_source not in ("ebay", "rgp", "both"):
         console.print("[red]Error:[/red] --only-source must be 'ebay', 'rgp', or 'both'")
