@@ -21,11 +21,21 @@ tasks:
       - uv run python -m price_enricher {{.CLI_ARGS}}
 
   enrich:
-    desc: Run enrichment on sample input file
+    desc: Run enrichment on sample input file (English)
     cmds:
       - |
-        uv run python -m price_enricher \
-          --input "input_files/sample_collection.csv" \
+        uv run python -m price_enricher main \
+          --input "input_files/sample_collection_en.csv" \
+          --output "output_files/enriched_collection.csv" \
+          --default-region PAL \
+          --sleep 1.5
+
+  enrich-fr:
+    desc: Run enrichment on sample input file (French)
+    cmds:
+      - |
+        uv run python -m price_enricher main \
+          --input "input_files/sample_collection_fr.csv" \
           --output "output_files/enriched_collection.csv" \
           --default-region PAL \
           --sleep 1.5
@@ -90,5 +100,5 @@ tasks:
       - echo ""
       - echo "📋 Next steps:"
       - echo "   1. Set EBAY_APP_ID environment variable"
-      - echo "   2. Run: task enrich"
-      - echo "   or: task run -- --help"
+      - echo "   2. Run 'task enrich' or 'task enrich-fr'"
+      - echo "   or 'task run -- main --help'"
