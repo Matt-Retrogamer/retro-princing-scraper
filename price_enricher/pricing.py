@@ -204,8 +204,8 @@ class PricingEngine:
         """Build calculation details string."""
         parts = []
 
-        # Header
-        parts.append(f"=== {result.game.title} ({result.game.platform}) ===")
+        # Header - use ### instead of === to avoid Excel formula interpretation
+        parts.append(f"### {result.game.title} ({result.game.platform}) ###")
         parts.append(f"Packaging: {result.game.packaging_state.value}")
         parts.append(f"Region: {result.game.region.value}")
         parts.append("")

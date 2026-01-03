@@ -307,7 +307,7 @@ The tool is designed to be respectful of external services:
 ### Calculation Details Field
 
 ```
-=== Super Mario World (SNES) ===
+### Super Mario World (SNES) ###
 Packaging: CIB
 Region: PAL
 
