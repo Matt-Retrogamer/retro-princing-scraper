@@ -515,7 +515,7 @@ class RGPClient:
 async def get_rgp_price(
     item: GameItem,
     cache: PriceCache | None = None,
-    sleep_seconds: float = 3.0,
+    sleep_seconds: float = 10.0,
 ) -> PriceResult:
     """
     Convenience function to get price estimate for a game item.
