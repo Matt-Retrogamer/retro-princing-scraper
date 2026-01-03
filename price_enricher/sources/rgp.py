@@ -41,6 +41,10 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+# Global rate limiting state (shared across all client instances)
+_global_rate_limit_lock = asyncio.Lock()
+_global_last_request_time = 0.0
+
 
 class RGPClient:
     """
@@ -64,17 +68,34 @@ class RGPClient:
         """
         self.cache = cache
         self.sleep_seconds = sleep_seconds
-        self._last_request_time = 0.0
 
     async def _rate_limit(self) -> None:
-        """Apply rate limiting between requests."""
-        now = asyncio.get_event_loop().time()
-        elapsed = now - self._last_request_time
-        if elapsed < self.sleep_seconds:
-            wait_time = self.sleep_seconds - elapsed
-            logger.debug(f"Rate limiting: waiting {wait_time:.2f}s")
-            await asyncio.sleep(wait_time)
-        self._last_request_time = asyncio.get_event_loop().time()
+        """Apply rate limiting between requests using global state."""
+        global _global_last_request_time
+        
+        # Use a lock to ensure only one request proceeds at a time
+        async with _global_rate_limit_lock:
+            now = asyncio.get_event_loop().time()
+            
+            # If this is the first request ever, just record the time
+            if _global_last_request_time == 0.0:
+                _global_last_request_time = now
+                logger.debug(f"Rate limit: First request, starting timer")
+                return
+            
+            # Calculate time since last request
+            elapsed = now - _global_last_request_time
+            
+            # If not enough time has passed, wait
+            if elapsed < self.sleep_seconds:
+                wait_time = self.sleep_seconds - elapsed
+                logger.debug(f"Rate limiting: waiting {wait_time:.2f}s (last request was {elapsed:.2f}s ago)")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.debug(f"Rate limit: OK, {elapsed:.2f}s elapsed (>{self.sleep_seconds}s required)")
+            
+            # Update global timestamp for next request
+            _global_last_request_time = asyncio.get_event_loop().time()
 
     @retry(
         stop=stop_after_attempt(3),
