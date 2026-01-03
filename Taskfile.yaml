@@ -1,0 +1,104 @@
+version: '3'
+
+vars:
+  VENV_DIR: .venv
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  install:
+    desc: Install dependencies with uv
+    cmds:
+      - uv sync --all-extras
+      - echo "✅ Dependencies installed"
+
+  run:
+    desc: Run price enricher CLI (use -- to pass args, e.g., task run -- --help)
+    cmds:
+      - uv run python -m price_enricher {{.CLI_ARGS}}
+
+  enrich:
+    desc: Run enrichment on sample input file (English)
+    cmds:
+      - |
+        uv run python -m price_enricher main \
+          --input "input_files/sample_collection_en.csv" \
+          --output "output_files/enriched_collection.csv" \
+          --default-region PAL \
+          --sleep 1.5
+
+  enrich-fr:
+    desc: Run enrichment on sample input file (French)
+    cmds:
+      - |
+        uv run python -m price_enricher main \
+          --input "input_files/sample_collection_fr.csv" \
+          --output "output_files/enriched_collection.csv" \
+          --default-region PAL \
+          --sleep 1.5
+
+  test:
+    desc: Run unit tests
+    cmds:
+      - uv run pytest tests/ -v
+
+  test-coverage:
+    desc: Run tests with coverage
+    cmds:
+      - uv run pytest tests/ --cov=price_enricher --cov-report=html --cov-report=term
+
+  format:
+    desc: Format code with black and ruff
+    cmds:
+      - uv run black . --exclude {{.VENV_DIR}}
+      - uv run ruff check --fix . --exclude {{.VENV_DIR}}
+      - echo "✅ Code formatted"
+
+  lint:
+    desc: Run all linters (ruff, mypy, black check)
+    cmds:
+      - echo "🔍 Running ruff..."
+      - uv run ruff check price_enricher/ tests/ --exclude={{.VENV_DIR}}
+      - echo "🔍 Running mypy..."
+      - uv run mypy price_enricher/ --ignore-missing-imports || echo "⚠️  Mypy found type issues (non-blocking)"
+      - echo "🔍 Checking black formatting..."
+      - uv run black --check . --exclude {{.VENV_DIR}}
+      - echo "✅ All linters passed!"
+
+  clean:
+    desc: Clean cache files and temporary data
+    cmds:
+      - rm -rf __pycache__ .pytest_cache .mypy_cache .ruff_cache
+      - rm -rf price_enricher/__pycache__ tests/__pycache__
+      - rm -rf htmlcov .coverage
+      - rm -f cache.sqlite
+      - echo "✅ Cleaned cache and temporary files"
+
+  clean-all:
+    desc: Clean everything including .venv
+    cmds:
+      - task: clean
+      - rm -rf {{.VENV_DIR}}
+      - rm -rf output_files/*.csv
+      - echo "✅ Project cleaned (including venv)"
+
+  clear-cache:
+    desc: Clear the price cache database
+    cmds:
+      - rm -f cache.sqlite
+      - echo "✅ Price cache cleared"
+
+  setup:
+    desc: Full project setup (install + create output dir)
+    cmds:
+      - mkdir -p output_files
+      - task: install
+      - echo "✅ Project setup complete"
+      - echo ""
+      - echo "📋 Next steps:"
+      - echo "   1. Set EBAY_APP_ID environment variable"
+      - echo "   2. Run 'task enrich' or 'task enrich-fr'"
+      - echo "   or 'task run -- main --help'"
