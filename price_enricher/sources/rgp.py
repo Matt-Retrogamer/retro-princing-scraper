@@ -279,11 +279,13 @@ class RGPClient:
         - "New$11,999.99" (sealed - DO NOT use for pricing normal items)
         - "Box Only$258.33" (just the box)
         - "Manual Only$7.00" (just the manual)
+        - "Item & Box$276.94" (game + box, no manual)
+        - "Item & Manual$26.00" (game + manual, no box)
 
-        We want: Loose for loose items, Complete for CIB items.
+        We select the right price based on item components (has_game, has_box, has_manual).
         We NEVER want: New or Graded prices (those are for sealed/graded collectors).
 
-        Returns dict with loose_price, cib_price, box_only_price, manual_only_price (all optional).
+        Returns dict with all available prices.
         """
         soup = BeautifulSoup(html, "lxml")
         result = {}
@@ -303,6 +305,12 @@ class RGPClient:
             # Matches: "Complete$442.29" but NOT "Graded Complete" or "Incomplete"
             # Using negative lookbehind to avoid matching "Graded " prefix
             (r"(?<!Graded\s)(?<!Graded)Complete\$([\d,]+\.?\d*)", "cib_price"),
+
+            # Item & Box price (game + box, no manual)
+            (r"Item & Box\$([\d,]+\.?\d*)", "item_box_price"),
+
+            # Item & Manual price (game + manual, no box)
+            (r"Item & Manual\$([\d,]+\.?\d*)", "item_manual_price"),
 
             # Box Only price (the word "Box Only" has a space)
             (r"Box Only\$([\d,]+\.?\d*)", "box_only_price"),
@@ -365,11 +373,105 @@ class RGPClient:
                                 logger.debug(f"Table found manual_only_price: ${price}")
 
         if result:
-            logger.info(f"Parsed prices: loose=${result.get('loose_price')}, cib=${result.get('cib_price')}, box=${result.get('box_only_price')}, manual=${result.get('manual_only_price')}")
+            logger.info(f"Parsed prices: loose=${result.get('loose_price')}, cib=${result.get('cib_price')}, "
+                       f"item_box=${result.get('item_box_price')}, item_manual=${result.get('item_manual_price')}, "
+                       f"box=${result.get('box_only_price')}, manual=${result.get('manual_only_price')}")
         else:
             logger.warning("Could not parse any prices from game page")
 
         return result
+
+    def _select_price_for_item(self, item: GameItem, prices: dict) -> tuple[Decimal | None, str]:
+        """
+        Select the best price based on item components.
+
+        Uses has_game, has_box, has_manual to determine which price to use.
+
+        Args:
+            item: Game item with component flags
+            prices: Dict of parsed prices from PriceCharting
+
+        Returns:
+            Tuple of (selected_price, description of what was selected)
+        """
+        has_game = item.has_game == "Y"
+        has_box = item.has_box == "Y"
+        has_manual = item.has_manual == "Y"
+
+        loose = prices.get("loose_price")
+        cib = prices.get("cib_price")
+        item_box = prices.get("item_box_price")
+        item_manual = prices.get("item_manual_price")
+        box_only = prices.get("box_only_price")
+        manual_only = prices.get("manual_only_price")
+
+        # Case 1: No game - just accessories
+        if not has_game:
+            if has_box and has_manual:
+                # Box + Manual only (no game)
+                if box_only and manual_only:
+                    price = box_only + manual_only
+                    return price, f"Box Only + Manual Only (${box_only} + ${manual_only})"
+                return None, "Box + Manual only (no prices available)"
+            elif has_box:
+                if box_only:
+                    return box_only, "Box Only"
+                return None, "Box only (no price available)"
+            elif has_manual:
+                if manual_only:
+                    return manual_only, "Manual Only"
+                return None, "Manual only (no price available)"
+            return None, "No components"
+
+        # Case 2: Complete In Box (Game + Box + Manual)
+        if has_game and has_box and has_manual:
+            if cib:
+                return cib, "Complete (CIB)"
+            # Fallback: try to calculate from components
+            if loose and box_only and manual_only:
+                price = loose + box_only + manual_only
+                return price, f"Calculated CIB (Loose + Box + Manual: ${loose} + ${box_only} + ${manual_only})"
+            if item_box and manual_only:
+                price = item_box + manual_only
+                return price, f"Calculated CIB (Item&Box + Manual: ${item_box} + ${manual_only})"
+            return None, "CIB (no price available)"
+
+        # Case 3: Game + Box (no manual)
+        if has_game and has_box and not has_manual:
+            if item_box:
+                return item_box, "Item & Box"
+            # Fallback: calculate from Loose + Box Only
+            if loose and box_only:
+                price = loose + box_only
+                return price, f"Calculated Item&Box (Loose + Box: ${loose} + ${box_only})"
+            # Last resort: use CIB price as upper estimate
+            if cib:
+                return cib, "CIB (used as estimate for Item & Box)"
+            return loose, "Loose (Box value unknown)" if loose else (None, "Item & Box (no price available)")
+
+        # Case 4: Game + Manual (no box)
+        if has_game and has_manual and not has_box:
+            if item_manual:
+                return item_manual, "Item & Manual"
+            # Fallback: calculate from Loose + Manual Only
+            if loose and manual_only:
+                price = loose + manual_only
+                return price, f"Calculated Item&Manual (Loose + Manual: ${loose} + ${manual_only})"
+            # Last resort: use Loose price
+            return loose, "Loose (Manual value unknown)" if loose else (None, "Item & Manual (no price available)")
+
+        # Case 5: Game only (Loose)
+        if has_game and not has_box and not has_manual:
+            if loose:
+                return loose, "Loose"
+            return None, "Loose (no price available)"
+
+        # Default fallback
+        if loose:
+            return loose, "Loose (fallback)"
+        if cib:
+            return cib, "CIB (fallback)"
+        return None, "No price available"
 
     async def get_price(self, item: GameItem) -> PriceResult:
         """
@@ -437,28 +539,39 @@ class RGPClient:
             result.loose_price = prices.get("loose_price")
             result.cib_price = prices.get("cib_price")
 
-            # Select appropriate price based on packaging state
-            if item.packaging_state == PackagingState.CIB and result.cib_price:
-                result.price_eur = result.cib_price  # Note: Still in USD!
-            elif result.loose_price:
-                result.price_eur = result.loose_price  # Note: Still in USD!
-            elif result.cib_price:
-                result.price_eur = result.cib_price  # Fallback to CIB if no loose
+            # Select appropriate price based on item components (has_game, has_box, has_manual)
+            selected_price, price_description = self._select_price_for_item(item, prices)
+            result.price_eur = selected_price  # Note: Still in USD at this point!
 
             result.success = result.price_eur is not None
 
-            # Build details
+            # Build component description
+            components = []
+            if item.has_game == "Y":
+                components.append("Game")
+            if item.has_box == "Y":
+                components.append("Box")
+            if item.has_manual == "Y":
+                components.append("Manual")
+            component_str = " + ".join(components) if components else "None"
+
+            # Build details with all available prices
             details_parts = [
                 f"PriceCharting: {game_info['title']}",
-                f"  Loose: ${result.loose_price:.2f} USD" if result.loose_price else "  Loose: N/A",
-                f"  CIB: ${result.cib_price:.2f} USD" if result.cib_price else "  CIB: N/A",
-                f"  Selected ({item.packaging_state.value}): ${result.price_eur:.2f} USD" if result.price_eur else "",
+                f"  Components: {component_str}",
+                f"  Loose: ${prices.get('loose_price', 'N/A')}" if prices.get('loose_price') else "  Loose: N/A",
+                f"  CIB: ${prices.get('cib_price', 'N/A')}" if prices.get('cib_price') else "  CIB: N/A",
+                f"  Item & Box: ${prices.get('item_box_price', 'N/A')}" if prices.get('item_box_price') else None,
+                f"  Item & Manual: ${prices.get('item_manual_price', 'N/A')}" if prices.get('item_manual_price') else None,
+                f"  Box Only: ${prices.get('box_only_price', 'N/A')}" if prices.get('box_only_price') else None,
+                f"  Manual Only: ${prices.get('manual_only_price', 'N/A')}" if prices.get('manual_only_price') else None,
+                f"  → Selected: {price_description} = ${result.price_eur:.2f} USD" if result.price_eur else f"  → Selected: {price_description}",
                 f"  Note: Prices are in USD, will be converted to EUR",
                 f"  URL: {game_info['url']}",
             ]
             result.details = "\n".join(filter(None, details_parts))
 
-            logger.info(f"Found prices for {item.title}: loose=${result.loose_price}, cib=${result.cib_price}")
+            logger.info(f"Found prices for {item.title}: {price_description} = ${result.price_eur}" if result.price_eur else f"No price for {item.title}")
 
             # Cache the result
             if self.cache and result.success:
