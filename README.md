@@ -1,11 +1,11 @@
 # Price Enricher
 
-Enrich video game collection CSV with online price estimates from eBay (sold listings) and RetroGamePrices.com.
+Enrich video game collection CSV with online price estimates from eBay (sold listings) and PriceCharting.com.
 
 ## Features
 
-- **eBay Integration**: Queries eBay Finding API for completed/sold listings with strict region filtering
-- **RetroGamePrices**: Scrapes loose and CIB prices (with rate limiting and caching)
+- **eBay Integration**: Queries eBay Finding API for completed/sold listings with strict region filtering (requires API key)
+- **PriceCharting**: Scrapes loose and CIB prices from PriceCharting.com (works without API key)
 - **Multi-Language CSV Support**: Works with both English and French CSV files (auto-detected or specified)
 - **Region-Aware**: Mandatory region filtering for accurate pricing (PAL, NTSC-U, NTSC-J)
 - **Language Preference**: Optional language filtering for regional variants
@@ -30,22 +30,40 @@ Or manually with uv:
 uv sync --all-extras
 ```
 
-### 2. Configure eBay API
+### 2. Configure eBay API (Optional)
 
-Get your eBay App ID from [eBay Developer Program](https://developer.ebay.com/).
+The tool works without eBay by using PriceCharting.com as the price source.
+
+To enable eBay pricing (recommended for more accurate PAL region prices), get your eBay App ID from [eBay Developer Program](https://developer.ebay.com/).
 
 ```bash
 export EBAY_APP_ID="your-app-id-here"
 ```
 
+**Note:** If `EBAY_APP_ID` is not set, the tool will automatically use PriceCharting.com only.
+
 ### 3. Run Enrichment
 
 ```bash
-# Using the English sample file
+# Basic usage (uses PriceCharting if no eBay API key)
 uv run python -m price_enricher \
   --input "input_files/sample_collection_en.csv" \
   --output "output_files/enriched_collection.csv" \
   --default-region PAL
+
+# With verbose output to see what's happening
+uv run python -m price_enricher \
+  --input "input_files/sample_collection_en.csv" \
+  --output "output_files/enriched_collection.csv" \
+  --default-region PAL \
+  --verbose
+
+# With debug output for troubleshooting
+uv run python -m price_enricher \
+  --input "input_files/sample_collection_en.csv" \
+  --output "output_files/enriched_collection.csv" \
+  --default-region PAL \
+  --debug
 
 # Using the French sample file
 uv run python -m price_enricher \
@@ -130,14 +148,18 @@ uv run python -m price_enricher --help
 | `--output`, `-o` | Required | Output CSV file |
 | `--limit`, `-n` | None | Limit items to process |
 | `--sleep`, `-s` | 1.5 | Delay between API requests |
+| `--verbose`, `-v` | false | Show detailed progress |
+| `--debug`, `-d` | false | Enable debug logging |
 
 ### Source Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--only-source` | both | Use `ebay`, `rgp`, or `both` |
+| `--only-source` | both | Use `ebay`, `rgp`, or `both` (falls back to `rgp` if eBay unavailable) |
 | `--weight-ebay` | 0.7 | eBay weight in combined estimate |
-| `--weight-rgp` | 0.3 | RGP weight in combined estimate |
+| `--weight-rgp` | 0.3 | PriceCharting weight in combined estimate |
+
+**Note:** If `EBAY_APP_ID` is not set and `--only-source` is `both`, the tool automatically falls back to PriceCharting only.
 
 ### Region Options
 
@@ -197,7 +219,9 @@ uv run python -m price_enricher clear-cache --namespace ebay
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `EBAY_APP_ID` | Yes (for eBay) | eBay Application ID |
+| `EBAY_APP_ID` | No* | eBay Application ID for sold listings data |
+
+\* The tool works without `EBAY_APP_ID` by using PriceCharting.com as the price source. Set this variable to enable eBay pricing for more accurate regional prices.
 
 ## Packaging State Logic
 

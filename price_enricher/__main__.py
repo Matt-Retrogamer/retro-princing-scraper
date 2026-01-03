@@ -1,6 +1,7 @@
 """Price Enricher CLI - Enrich video game collection CSV with online price estimates."""
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.table import Table
@@ -21,11 +23,32 @@ from price_enricher.pricing import PricingConfig, PricingEngine, apply_enrichmen
 # Initialize Typer app
 app = typer.Typer(
     name="price-enricher",
-    help="Enrich video game collection CSV with online price estimates from eBay and RetroGamePrices.",
+    help="Enrich video game collection CSV with online price estimates from eBay and PriceCharting.",
     add_completion=False,
 )
 
 console = Console()
+
+
+def setup_logging(debug: bool = False, verbose: bool = False) -> None:
+    """Configure logging with Rich handler."""
+    level = logging.DEBUG if debug else (logging.INFO if verbose else logging.WARNING)
+
+    # Configure root logger
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=debug)],
+    )
+
+    # Set levels for our modules
+    for module in ["price_enricher", "price_enricher.sources.rgp", "price_enricher.sources.ebay"]:
+        logging.getLogger(module).setLevel(level)
+
+    # Reduce noise from third-party libraries
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def version_callback(value: bool) -> None:
@@ -164,11 +187,16 @@ def main(
         help="Process items without game (has_game != Y)",
     ),
 
-    # Debug
+    # Debug and verbosity
     debug: bool = typer.Option(
         False,
         "--debug", "-d",
-        help="Enable debug output",
+        help="Enable debug output (very verbose)",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose", "-v",
+        help="Enable verbose output (show progress details)",
     ),
     preview: bool = typer.Option(
         False,
@@ -179,7 +207,7 @@ def main(
     # Version
     version: bool = typer.Option(
         False,
-        "--version", "-v",
+        "--version", "-V",
         callback=version_callback,
         is_eager=True,
         help="Show version and exit",
@@ -188,7 +216,7 @@ def main(
     """
     Enrich a video game collection CSV with online price estimates.
 
-    Queries eBay (sold listings) and RetroGamePrices.com to estimate
+    Queries eBay (sold listings) and PriceCharting.com to estimate
     market values for each game in the collection.
 
     Example:
@@ -197,6 +225,10 @@ def main(
     # If a subcommand is invoked, skip the main enrichment logic
     if ctx.invoked_subcommand is not None:
         return
+
+    # Setup logging based on verbosity
+    setup_logging(debug=debug, verbose=verbose)
+    logger = logging.getLogger(__name__)
 
     # Validate required options for the main enrichment command
     if input_file is None:
@@ -237,15 +269,18 @@ def main(
             raise typer.Exit(1)
 
     # Check eBay credentials if needed
+    ebay_available = bool(os.environ.get("EBAY_APP_ID"))
     if only_source in ("ebay", "both"):
-        if not os.environ.get("EBAY_APP_ID"):
-            console.print("[yellow]Warning:[/yellow] EBAY_APP_ID not set")
+        if not ebay_available:
             if only_source == "ebay":
-                console.print("[red]Error:[/red] eBay API requires EBAY_APP_ID environment variable")
+                console.print("[red]Error:[/red] eBay source requires EBAY_APP_ID environment variable")
+                console.print("Get your API key at: https://developer.ebay.com/")
                 raise typer.Exit(1)
             else:
-                console.print("  Falling back to RetroGamePrices only")
+                console.print("[yellow]Note:[/yellow] EBAY_APP_ID not set - using PriceCharting only")
+                console.print("  Set EBAY_APP_ID environment variable to enable eBay pricing")
                 only_source = "rgp"
+                logger.info("eBay disabled: EBAY_APP_ID not set")
 
     # Preview mode
     if preview:
