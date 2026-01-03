@@ -53,7 +53,7 @@ class RGPClient:
     def __init__(
         self,
         cache: PriceCache | None = None,
-        sleep_seconds: float = 2.0,
+        sleep_seconds: float = 10.0,
     ):
         """
         Initialize RGP client.
@@ -273,75 +273,102 @@ class RGPClient:
         """
         Parse PriceCharting game detail page for prices.
 
-        Returns dict with loose_price, cib_price, new_price (all optional).
+        PriceCharting format shows prices like:
+        - "Loose$18.61" (cartridge/disc only)
+        - "Complete$442.29" (game + box + manual - CIB)
+        - "New$11,999.99" (sealed - DO NOT use for pricing normal items)
+        - "Box Only$258.33" (just the box)
+        - "Manual Only$7.00" (just the manual)
+
+        We want: Loose for loose items, Complete for CIB items.
+        We NEVER want: New or Graded prices (those are for sealed/graded collectors).
+
+        Returns dict with loose_price, cib_price, box_only_price, manual_only_price (all optional).
         """
         soup = BeautifulSoup(html, "lxml")
         result = {}
 
-        # PriceCharting has a price table with specific IDs
-        # Try to find prices by common patterns
+        # Get full page text to search with regex
+        all_text = soup.get_text()
 
-        # Method 1: Look for specific price elements (PriceCharting format)
-        price_mapping = {
-            "loose_price": ["loose", "cart", "cartridge", "disc only"],
-            "cib_price": ["cib", "complete", "complete in box"],
-            "new_price": ["new", "sealed", "graded"],
-        }
+        # PriceCharting format: "LabelName$XX.XX" with NO space between label and $
+        # Example: "Loose$18.61Item & Box$276.94Complete$442.29..."
 
-        # Look for price tables
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            for row in rows:
-                cells = row.find_all(["td", "th"])
-                if len(cells) >= 2:
-                    label = cells[0].get_text().lower().strip()
-                    price_text = cells[-1].get_text().strip()
+        price_patterns = [
+            # Loose price - for cartridge/disc only items
+            # Matches: "Loose$18.61" (no space between Loose and $)
+            (r"\bLoose\$([\d,]+\.?\d*)", "loose_price"),
 
-                    for key, keywords in price_mapping.items():
-                        if any(kw in label for kw in keywords):
+            # Complete/CIB price - for complete in box items
+            # Matches: "Complete$442.29" but NOT "Graded Complete" or "Incomplete"
+            # Using negative lookbehind to avoid matching "Graded " prefix
+            (r"(?<!Graded\s)(?<!Graded)Complete\$([\d,]+\.?\d*)", "cib_price"),
+
+            # Box Only price (the word "Box Only" has a space)
+            (r"Box Only\$([\d,]+\.?\d*)", "box_only_price"),
+
+            # Manual Only price (the word "Manual Only" has a space)
+            (r"Manual Only\$([\d,]+\.?\d*)", "manual_only_price"),
+        ]
+
+        for pattern, key in price_patterns:
+            match = re.search(pattern, all_text, re.IGNORECASE)
+            if match:
+                try:
+                    price_str = match.group(1).replace(",", "")
+                    price = Decimal(price_str)
+                    # Sanity check: ignore prices over $50,000 (likely parsing error)
+                    if price < 50000:
+                        result[key] = price
+                        logger.debug(f"Found {key}: ${price}")
+                    else:
+                        logger.warning(f"Ignoring unreasonably high {key}: ${price}")
+                except Exception as e:
+                    logger.debug(f"Failed to parse price from '{match.group(1)}': {e}")
+
+        # Fallback: Try to find prices in table format if regex didn't work
+        if not result:
+            logger.debug("Regex parsing failed, trying table parsing...")
+            for table in soup.find_all("table"):
+                rows = table.find_all("tr")
+                for row in rows:
+                    cells = row.find_all(["td", "th"])
+                    if len(cells) >= 2:
+                        label = cells[0].get_text().lower().strip()
+                        price_text = cells[-1].get_text().strip()
+
+                        # Map table labels to price keys
+                        # IMPORTANT: We specifically do NOT map "new" or "sealed" here
+                        if "loose" in label and "loose_price" not in result:
                             price = self._parse_price(price_text)
-                            if price:
-                                result[key] = price
-                                logger.debug(f"Found {key}: ${price}")
+                            if price and price < 50000:
+                                result["loose_price"] = price
+                                logger.debug(f"Table found loose_price: ${price}")
 
-        # Method 2: Look for price spans/divs with specific classes
-        if not result:
-            for key, keywords in price_mapping.items():
-                for kw in keywords:
-                    elem = soup.find(["span", "td", "div"], string=re.compile(kw, re.I))
-                    if elem:
-                        parent = elem.find_parent("tr") or elem.find_parent("div")
-                        if parent:
-                            price_elem = parent.find(string=re.compile(r"\$[\d,]+\.?\d*"))
-                            if price_elem:
-                                price = self._parse_price(str(price_elem))
-                                if price:
-                                    result[key] = price
+                        elif label == "complete" and "cib_price" not in result:
+                            # Exact match for "complete" to avoid "incomplete"
+                            price = self._parse_price(price_text)
+                            if price and price < 50000:
+                                result["cib_price"] = price
+                                logger.debug(f"Table found cib_price: ${price}")
 
-        # Method 3: Regex search on entire page
-        if not result:
-            all_text = soup.get_text()
-            patterns = [
-                (r"loose[:\s]*\$?([\d,]+\.?\d*)", "loose_price"),
-                (r"cart(?:ridge)?[:\s]*\$?([\d,]+\.?\d*)", "loose_price"),
-                (r"cib[:\s]*\$?([\d,]+\.?\d*)", "cib_price"),
-                (r"complete[:\s]*\$?([\d,]+\.?\d*)", "cib_price"),
-                (r"new[:\s]*\$?([\d,]+\.?\d*)", "new_price"),
-                (r"sealed[:\s]*\$?([\d,]+\.?\d*)", "new_price"),
-            ]
+                        elif "box only" in label and "box_only_price" not in result:
+                            price = self._parse_price(price_text)
+                            if price and price < 50000:
+                                result["box_only_price"] = price
+                                logger.debug(f"Table found box_only_price: ${price}")
 
-            for pattern, key in patterns:
-                if key not in result:
-                    match = re.search(pattern, all_text, re.IGNORECASE)
-                    if match:
-                        try:
-                            price_str = match.group(1).replace(",", "")
-                            result[key] = Decimal(price_str)
-                            logger.debug(f"Regex found {key}: ${result[key]}")
-                        except Exception:
-                            pass
+                        elif "manual only" in label and "manual_only_price" not in result:
+                            price = self._parse_price(price_text)
+                            if price and price < 50000:
+                                result["manual_only_price"] = price
+                                logger.debug(f"Table found manual_only_price: ${price}")
 
-        logger.debug(f"Parsed prices: {result}")
+        if result:
+            logger.info(f"Parsed prices: loose=${result.get('loose_price')}, cib=${result.get('cib_price')}, box=${result.get('box_only_price')}, manual=${result.get('manual_only_price')}")
+        else:
+            logger.warning("Could not parse any prices from game page")
+
         return result
 
     async def get_price(self, item: GameItem) -> PriceResult:
@@ -488,7 +515,7 @@ class RGPClient:
 async def get_rgp_price(
     item: GameItem,
     cache: PriceCache | None = None,
-    sleep_seconds: float = 2.0,
+    sleep_seconds: float = 3.0,
 ) -> PriceResult:
     """
     Convenience function to get price estimate for a game item.
