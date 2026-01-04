@@ -316,8 +316,32 @@ class GameItem:
 
     @property
     def is_processable(self) -> bool:
-        """Check if this item should be processed (has game)."""
+        """
+        Check if this item should be processed.
+        
+        An item is processable if it has any priceable component:
+        - Game (cartridge/disc)
+        - Box only
+        - Manual only
+        - Any combination of the above
+        
+        Items with no components (all N or empty) are not processable.
+        """
+        return (
+            self.has_game == "Y" or 
+            self.has_box == "Y" or 
+            self.has_manual == "Y"
+        )
+
+    @property
+    def is_game_item(self) -> bool:
+        """Check if this item includes the game (cartridge/disc)."""
         return self.has_game == "Y"
+
+    @property
+    def is_accessory_only(self) -> bool:
+        """Check if this item is accessory only (box/manual without game)."""
+        return self.has_game != "Y" and (self.has_box == "Y" or self.has_manual == "Y")
 
 
 @dataclass
