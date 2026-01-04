@@ -203,12 +203,52 @@ class TestGameItem:
         assert item.packaging_state == PackagingState.UNKNOWN
 
     def test_is_processable(self):
-        """Test processable detection."""
-        processable = GameItem(platform="SNES", title="Test", has_game="Y")
-        not_processable = GameItem(platform="SNES", title="Test", has_game="N")
+        """Test processable detection - any priceable component is processable."""
+        # Game items are processable
+        game_item = GameItem(platform="SNES", title="Test", has_game="Y")
+        assert game_item.is_processable is True
+        
+        # Box-only items are processable
+        box_only = GameItem(platform="SNES", title="Test", has_game="N", has_box="Y", has_manual="N")
+        assert box_only.is_processable is True
+        
+        # Manual-only items are processable
+        manual_only = GameItem(platform="SNES", title="Test", has_game="N", has_box="N", has_manual="Y")
+        assert manual_only.is_processable is True
+        
+        # Items with no priceable components are not processable
+        nothing = GameItem(platform="SNES", title="Test", has_game="N", has_box="N", has_manual="N")
+        assert nothing.is_processable is False
 
-        assert processable.is_processable is True
-        assert not_processable.is_processable is False
+    def test_is_game_item(self):
+        """Test game item detection."""
+        game_item = GameItem(platform="SNES", title="Test", has_game="Y")
+        assert game_item.is_game_item is True
+        
+        accessory_item = GameItem(platform="SNES", title="Test", has_game="N", has_box="Y")
+        assert accessory_item.is_game_item is False
+
+    def test_is_accessory_only(self):
+        """Test accessory-only detection (box/manual without game)."""
+        # Box only
+        box_only = GameItem(platform="SNES", title="Test", has_game="N", has_box="Y", has_manual="N")
+        assert box_only.is_accessory_only is True
+        
+        # Manual only
+        manual_only = GameItem(platform="SNES", title="Test", has_game="N", has_box="N", has_manual="Y")
+        assert manual_only.is_accessory_only is True
+        
+        # Box and manual (no game)
+        box_and_manual = GameItem(platform="SNES", title="Test", has_game="N", has_box="Y", has_manual="Y")
+        assert box_and_manual.is_accessory_only is True
+        
+        # Game item is not accessory only
+        game_item = GameItem(platform="SNES", title="Test", has_game="Y", has_box="Y")
+        assert game_item.is_accessory_only is False
+        
+        # Nothing is not accessory only
+        nothing = GameItem(platform="SNES", title="Test", has_game="N", has_box="N", has_manual="N")
+        assert nothing.is_accessory_only is False
 
 
 class TestColumnMappings:
