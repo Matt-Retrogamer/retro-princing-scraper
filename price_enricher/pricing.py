@@ -45,7 +45,8 @@ class PricingConfig:
     strict_language: bool = False
 
     # Rate limiting
-    sleep_seconds: float = 1.5
+    sleep_seconds: float = 1.5  # For eBay
+    rgp_sleep_seconds: float = 12.0  # For PriceCharting (rate limits aggressively)
 
     # Processing
     include_non_game: bool = False
@@ -134,7 +135,7 @@ class PricingEngine:
                 rgp_result = await get_rgp_price(
                     item=item,
                     cache=self.cache,
-                    sleep_seconds=self.config.sleep_seconds,
+                    sleep_seconds=self.config.rgp_sleep_seconds,
                 )
 
                 # Convert RGP price from USD to EUR

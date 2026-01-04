@@ -87,9 +87,16 @@ def main(
     sleep: float = typer.Option(
         1.5,
         "--sleep", "-s",
-        help="Sleep time between API requests (seconds)",
+        help="Sleep time between eBay API requests (seconds)",
         min=0.5,
         max=10.0,
+    ),
+    rgp_sleep: float = typer.Option(
+        12.0,
+        "--rgp-sleep",
+        help="Sleep time between PriceCharting requests (seconds). PriceCharting rate limits aggressively.",
+        min=5.0,
+        max=60.0,
     ),
 
     # Cache
@@ -371,6 +378,7 @@ def main(
         preferred_language=language,
         strict_language=strict_language,
         sleep_seconds=sleep,
+        rgp_sleep_seconds=rgp_sleep,
         include_non_game=include_non_game,
     )
     config.validate()

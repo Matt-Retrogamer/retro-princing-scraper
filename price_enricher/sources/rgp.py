@@ -2,6 +2,30 @@
 
 Uses PriceCharting.com as the primary data source for retro game prices.
 The original RetroGamePrices.com doesn't provide a working search API.
+
+Search Strategy:
+----------------
+1. Builds a search URL matching the website's format (type=prices)
+2. Parses the #games_table table in search results
+3. Extracts structured data from each product row:
+   - Game URL, title, platform, and region from the table cells
+4. Scores and ranks matches based on:
+   - Title similarity (50% weight)
+   - Region match (30% weight) - PAL/JP/NTSC-U
+   - Platform match (20% weight)
+5. If redirected directly to a game page (exact match), uses that
+6. Fetches the game detail page and extracts prices
+
+Supported Price Types:
+---------------------
+- Loose: Game/cartridge/disc only
+- CIB (Complete In Box): Game + box + manual
+- Item & Box: Game + box, no manual
+- Item & Manual: Game + manual, no box
+- Box Only: Just the box
+- Manual Only: Just the manual
+
+The appropriate price is selected based on item components (has_game, has_box, has_manual).
 """
 
 import asyncio
@@ -42,8 +66,17 @@ USER_AGENT = (
 )
 
 # Global rate limiting state (shared across all client instances)
-_global_rate_limit_lock = asyncio.Lock()
+# Lock is initialized lazily to avoid issues with event loop not being ready at import time
+_global_rate_limit_lock: asyncio.Lock | None = None
 _global_last_request_time = 0.0
+
+
+def _get_rate_limit_lock() -> asyncio.Lock:
+    """Get or create the global rate limit lock (lazy initialization)."""
+    global _global_rate_limit_lock
+    if _global_rate_limit_lock is None:
+        _global_rate_limit_lock = asyncio.Lock()
+    return _global_rate_limit_lock
 
 
 class RGPClient:
@@ -57,14 +90,14 @@ class RGPClient:
     def __init__(
         self,
         cache: PriceCache | None = None,
-        sleep_seconds: float = 10.0,
+        sleep_seconds: float = 15.0,
     ):
         """
         Initialize RGP client.
 
         Args:
             cache: Optional cache instance
-            sleep_seconds: Delay between requests (be respectful!)
+            sleep_seconds: Delay between requests (be respectful! PriceCharting rate limits aggressively)
         """
         self.cache = cache
         self.sleep_seconds = sleep_seconds
@@ -72,15 +105,16 @@ class RGPClient:
     async def _rate_limit(self) -> None:
         """Apply rate limiting between requests using global state."""
         global _global_last_request_time
+        import time
         
-        # Use a lock to ensure only one request proceeds at a time
-        async with _global_rate_limit_lock:
-            now = asyncio.get_event_loop().time()
+        # Use lazily-initialized lock to ensure only one request proceeds at a time
+        async with _get_rate_limit_lock():
+            now = time.monotonic()
             
             # If this is the first request ever, just record the time
             if _global_last_request_time == 0.0:
                 _global_last_request_time = now
-                logger.debug(f"Rate limit: First request, starting timer")
+                logger.info(f"Rate limit: First request, no delay needed")
                 return
             
             # Calculate time since last request
@@ -89,13 +123,13 @@ class RGPClient:
             # If not enough time has passed, wait
             if elapsed < self.sleep_seconds:
                 wait_time = self.sleep_seconds - elapsed
-                logger.debug(f"Rate limiting: waiting {wait_time:.2f}s (last request was {elapsed:.2f}s ago)")
+                logger.info(f"Rate limiting: waiting {wait_time:.1f}s before next request...")
                 await asyncio.sleep(wait_time)
             else:
-                logger.debug(f"Rate limit: OK, {elapsed:.2f}s elapsed (>{self.sleep_seconds}s required)")
+                logger.debug(f"Rate limit: OK, {elapsed:.1f}s elapsed (>{self.sleep_seconds}s required)")
             
-            # Update global timestamp for next request
-            _global_last_request_time = asyncio.get_event_loop().time()
+            # Update timestamp AFTER any sleep, just before releasing lock
+            _global_last_request_time = time.monotonic()
 
     @retry(
         stop=stop_after_attempt(3),
@@ -103,8 +137,12 @@ class RGPClient:
         retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError)),
         reraise=True,
     )
-    async def _make_request(self, url: str) -> str:
-        """Make HTTP request with retry and rate limiting."""
+    async def _make_request(self, url: str) -> tuple[str, str]:
+        """Make HTTP request with retry and rate limiting.
+        
+        Returns:
+            Tuple of (response_text, final_url) - final_url may differ from input if redirected
+        """
         await self._rate_limit()
 
         headers = {
@@ -118,7 +156,8 @@ class RGPClient:
 
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             response = await client.get(url, headers=headers)
-            logger.debug(f"Response status: {response.status_code}")
+            final_url = str(response.url)
+            logger.debug(f"Response status: {response.status_code}, final URL: {final_url}")
 
             if response.status_code == 404:
                 raise ValueError(f"Page not found: {url}")
@@ -126,19 +165,57 @@ class RGPClient:
                 raise ValueError(f"Access forbidden (possible rate limiting): {url}")
 
             response.raise_for_status()
-            return response.text
+            return response.text, final_url
+
+    def _clean_title_for_search(self, title: str) -> str:
+        """Clean up title for better search matching.
+        
+        Removes:
+        - Parenthetical notes like (loose), (Special Edition), (Platinum), (Essentials)
+        - Special characters
+        - Extra whitespace
+        """
+        # Remove common parenthetical notes that don't help with search
+        cleaned = re.sub(r'\s*\([^)]*(?:loose|edition|platinum|essentials|classics|best seller|demo|rpg)\s*\)', '', title, flags=re.IGNORECASE)
+        # Remove remaining parenthetical content that might be region/version specific
+        cleaned = re.sub(r'\s*\([^)]*\)\s*$', '', cleaned)
+        # Remove special characters except basic punctuation
+        cleaned = re.sub(r'[^\w\s\'-]', ' ', cleaned)
+        # Normalize whitespace
+        cleaned = ' '.join(cleaned.split())
+        return cleaned.strip()
 
     def _build_search_url(self, title: str, platform: str, region: str = "") -> str:
-        """Build search URL for PriceCharting."""
-        # Clean up title for search, include region for better matching
+        """
+        Build search URL for PriceCharting.
+        
+        Uses the same URL format as the website's search form:
+        https://www.pricecharting.com/search-products?type=prices&q={query}
+        
+        Args:
+            title: Game title to search for
+            platform: Platform name (e.g., "Nintendo 3DS", "Gameboy")
+            region: Region string (e.g., "PAL", "JP", or "" for NTSC-U)
+            
+        Returns:
+            Full search URL
+        """
+        # Clean up title for search - remove parenthetical notes that hurt search
+        clean_title = self._clean_title_for_search(title)
+        
+        # Build search term with platform and optional region
         if region:
-            search_term = f"{title} {platform} {region}"
+            search_term = f"{clean_title} {platform} {region}"
         else:
-            search_term = f"{title} {platform}"
-        search_term = re.sub(r"[^\w\s-]", " ", search_term)
+            search_term = f"{clean_title} {platform}"
+        
+        # Keep apostrophes and basic punctuation that help search accuracy
+        # Only remove truly problematic characters
+        search_term = re.sub(r"[^\w\s\'-]", " ", search_term)
         search_term = " ".join(search_term.split())  # Normalize whitespace
 
-        return f"{PRICECHARTING_SEARCH_URL}?q={quote_plus(search_term)}&type=videogames"
+        # Use type=prices (same as website) instead of type=videogames
+        return f"{PRICECHARTING_SEARCH_URL}?type=prices&q={quote_plus(search_term)}"
 
     def _map_region_to_pricecharting(self, region: Region) -> str:
         """Map region enum to PriceCharting search term."""
@@ -244,81 +321,319 @@ class RGPClient:
 
         return None
 
+    def _is_game_detail_page(self, url: str) -> bool:
+        """
+        Check if the URL is a game detail page (not search results).
+        
+        PriceCharting redirects directly to game pages for exact/good matches.
+        - Game detail pages: /game/platform/game-name
+        - Search results: /search-products?...
+        """
+        # Simple and reliable: check if URL contains /game/ path segment
+        is_game_page = "/game/" in url and "/search" not in url
+        logger.debug(f"URL check - is game page: {is_game_page} ({url})")
+        return is_game_page
+
+    def _extract_game_title_from_page(self, html: str) -> str | None:
+        """Extract the game title from a game detail page."""
+        soup = BeautifulSoup(html, "lxml")
+        
+        # Try various selectors for the title
+        # 1. h1 tag (most common)
+        h1 = soup.find("h1")
+        if h1:
+            title = h1.get_text().strip()
+            # Remove any "Prices" suffix that PriceCharting adds
+            title = re.sub(r"\s+Prices?$", "", title, flags=re.IGNORECASE)
+            if title:
+                return title
+        
+        # 2. Title tag
+        title_tag = soup.find("title")
+        if title_tag:
+            title = title_tag.get_text().strip()
+            # Remove site name and common suffixes
+            title = re.sub(r"\s*[-|].*$", "", title)
+            title = re.sub(r"\s+Prices?$", "", title, flags=re.IGNORECASE)
+            if title:
+                return title
+        
+        return None
+
+    def _extract_platform_from_url(self, url: str) -> tuple[str, str]:
+        """
+        Extract platform slug and region from PriceCharting game URL.
+        
+        URLs have format: /game/{platform-slug}/{game-slug}
+        Platform slugs can include region prefix: pal-gameboy, jp-nintendo-3ds, etc.
+        
+        Returns:
+            Tuple of (platform_slug, region) where region is 'pal', 'jp', or '' (NTSC-U)
+        """
+        # Parse the URL path to extract platform
+        # URL examples:
+        #   https://www.pricecharting.com/game/pal-gameboy/super-mario-land-2
+        #   https://www.pricecharting.com/game/pal-nintendo-3ds/luigi's-mansion-2
+        #   /game/gameboy/super-mario-land-2  (relative)
+        
+        # Extract the path after /game/
+        match = re.search(r'/game/([^/]+)/', url)
+        if not match:
+            return ("", "")
+        
+        platform_slug = match.group(1).lower()
+        
+        # Check for region prefix
+        if platform_slug.startswith("pal-"):
+            return (platform_slug[4:], "pal")
+        elif platform_slug.startswith("jp-"):
+            return (platform_slug[3:], "jp")
+        else:
+            return (platform_slug, "")  # NTSC-U (default, no prefix)
+
+    def _normalize_platform_for_comparison(self, platform: str) -> str:
+        """
+        Normalize platform name for comparison with URL slugs.
+        
+        Converts input platform names to lowercase slug format matching PriceCharting URLs.
+        """
+        # Map common variations to URL slug format
+        platform_lower = platform.lower().replace(" ", "-")
+        
+        # Special mappings for platforms that differ between input and URL slug
+        slug_map = {
+            "game-boy": "gameboy",
+            "game-boy-color": "gameboy-color", 
+            "game-boy-advance": "gameboy-advance",
+            "nintendo-3ds": "nintendo-3ds",
+            "3ds": "nintendo-3ds",
+            "nintendo-ds": "nintendo-ds",
+            "nds": "nintendo-ds",
+            "super-nintendo": "super-nintendo",
+            "snes": "super-nintendo",
+            "nintendo-64": "nintendo-64",
+            "n64": "nintendo-64",
+            "gamecube": "gamecube",
+            "gc": "gamecube",
+            "mega-drive": "sega-genesis",
+            "genesis": "sega-genesis",
+            "sega-genesis": "sega-genesis",
+            "playstation": "playstation",
+            "ps1": "playstation",
+            "psx": "playstation",
+            "playstation-2": "playstation-2",
+            "ps2": "playstation-2",
+            "playstation-3": "playstation-3",
+            "ps3": "playstation-3",
+            "playstation-4": "playstation-4",
+            "ps4": "playstation-4",
+            "ps-vita": "playstation-vita",
+            "dreamcast": "sega-dreamcast",
+            "sega-dreamcast": "sega-dreamcast",
+            "saturn": "sega-saturn",
+            "sega-saturn": "sega-saturn",
+            "master-system": "sega-master-system",
+            "game-gear": "sega-game-gear",
+            "nes": "nes",
+            "wii": "wii",
+            "wii-u": "wii-u",
+            "nintendo-switch": "nintendo-switch",
+        }
+        
+        return slug_map.get(platform_lower, platform_lower)
+
+    def _calculate_title_similarity(self, search_title: str, result_title: str) -> float:
+        """
+        Calculate similarity score between search title and result title.
+        
+        Returns a score from 0.0 to 1.0 where 1.0 is exact match.
+        """
+        # Normalize both titles
+        search_clean = self._clean_title_for_search(search_title).lower()
+        result_clean = self._clean_title_for_search(result_title).lower()
+        
+        # Exact match
+        if search_clean == result_clean:
+            return 1.0
+        
+        # One contains the other
+        if search_clean in result_clean or result_clean in search_clean:
+            # Score based on length ratio
+            shorter = min(len(search_clean), len(result_clean))
+            longer = max(len(search_clean), len(result_clean))
+            return 0.8 + (0.2 * shorter / longer) if longer > 0 else 0.8
+        
+        # Word-based matching
+        search_words = set(search_clean.split())
+        result_words = set(result_clean.split())
+        
+        # Remove very short words for matching
+        search_words_significant = {w for w in search_words if len(w) > 2}
+        result_words_significant = {w for w in result_words if len(w) > 2}
+        
+        if not search_words_significant:
+            search_words_significant = search_words
+        
+        # Calculate overlap
+        common_words = search_words_significant & result_words_significant
+        
+        if not common_words:
+            return 0.0
+        
+        # Score based on coverage of search words in result
+        coverage = len(common_words) / len(search_words_significant) if search_words_significant else 0
+        
+        return min(0.7, coverage * 0.7)  # Cap at 0.7 for word-based matching
+
     def _parse_search_results(self, html: str, title: str, platform: str, region: str = "") -> dict | None:
         """
         Parse PriceCharting search results page to find matching game.
 
-        Returns dict with game URL and title if found.
+        PriceCharting search results are displayed in a table with id="games_table".
+        Each game row has:
+        - Row with id="product-{id}" and data-product="{id}"
+        - Title cell (.title) with link to game page
+        - Console/platform cell (.console) with platform name
+        - Price cells for loose, CIB, new
+
+        Args:
+            html: The HTML content of the search results page
+            title: The game title we're searching for
+            platform: The platform (e.g., "Nintendo 3DS", "Game Boy")
+            region: The region ("PAL", "JP", or "" for NTSC-U)
+
+        Returns:
+            Dict with 'url' and 'title' of best matching game, or None if not found
         """
         soup = BeautifulSoup(html, "lxml")
-        title_lower = title.lower()
-        platform_mapped = self._map_platform_to_pricecharting(platform).lower()
+        
+        # Normalize inputs for matching
+        search_title_clean = self._clean_title_for_search(title).lower()
+        platform_slug = self._normalize_platform_for_comparison(platform)
         region_lower = region.lower() if region else ""
-
-        logger.debug(f"Searching for title='{title_lower}', platform='{platform_mapped}', region='{region_lower}'")
-
-        # PriceCharting shows results in a table or list
-        # Look for product links
-        product_links = soup.select("a[href*='/game/']")
-
-        best_match = None
-        best_score = 0
-
-        for link in product_links:
-            href = link.get("href", "")
-            link_text = link.get_text().lower().strip()
-
-            # Check platform in URL or text
-            parent = link.find_parent("tr") or link.find_parent("div")
-            parent_text = parent.get_text().lower() if parent else ""
-
-            # Score this match
-            score = 0
-
-            # Title matching (fuzzy)
-            title_words = set(title_lower.split())
-            link_words = set(link_text.split())
-            common_words = title_words & link_words
-            if common_words:
-                score += len(common_words) * 10
-
-            # Exact title bonus
-            if title_lower in link_text:
-                score += 50
-
+        
+        logger.debug(f"Parsing search results for: title='{search_title_clean}', platform='{platform_slug}', region='{region_lower}'")
+        
+        # Find the games table - this is the main search results container
+        games_table = soup.find("table", id="games_table")
+        
+        if not games_table:
+            logger.warning("Could not find #games_table in search results")
+            # Fallback: look for any table with product rows
+            games_table = soup.find("table", class_="hoverable-rows")
+        
+        if not games_table:
+            logger.warning("No games table found in search results HTML")
+            return None
+        
+        # Find all product rows (they have id like "product-12345")
+        product_rows = games_table.find_all("tr", id=lambda x: x and x.startswith("product-"))
+        
+        if not product_rows:
+            # Try alternate selector
+            product_rows = games_table.find_all("tr", attrs={"data-product": True})
+        
+        logger.debug(f"Found {len(product_rows)} product rows in search results")
+        
+        if not product_rows:
+            return None
+        
+        candidates = []
+        
+        for row in product_rows:
+            # Extract game URL from title cell link
+            title_cell = row.find("td", class_="title")
+            if not title_cell:
+                continue
+            
+            title_link = title_cell.find("a", href=True)
+            if not title_link:
+                continue
+            
+            game_url = title_link.get("href", "")
+            game_title = title_link.get_text().strip()
+            
+            # Skip if no valid URL
+            if "/game/" not in game_url:
+                continue
+            
+            # Extract platform and region from URL
+            url_platform, url_region = self._extract_platform_from_url(game_url)
+            
+            # Also try to get platform from console cell as backup
+            console_cell = row.find("td", class_="console")
+            console_text = console_cell.get_text().strip().lower() if console_cell else ""
+            
+            # Calculate match scores
+            title_score = self._calculate_title_similarity(title, game_title)
+            
             # Platform matching
-            if platform_mapped in parent_text or platform_mapped in href.lower():
-                score += 30
-
-            # Region matching - boost PAL/JP matches if searching for those regions
+            platform_score = 0.0
+            if url_platform:
+                # Check if platforms match (normalize both for comparison)
+                if platform_slug in url_platform or url_platform in platform_slug:
+                    platform_score = 1.0
+                elif platform_slug.replace("-", "") in url_platform.replace("-", ""):
+                    platform_score = 0.9
+                # Also check console text
+                elif platform_slug.replace("-", " ") in console_text:
+                    platform_score = 0.8
+            
+            # Region matching
+            region_score = 0.0
             if region_lower:
-                href_lower = href.lower()
-                # PriceCharting uses "pal-" prefix for PAL versions in URLs
-                if region_lower == "pal" and "pal-" in href_lower:
-                    score += 40  # Boost PAL matches
-                    logger.debug(f"  PAL match found in URL: {href}")
-                elif region_lower == "jp" and ("jp-" in href_lower or "japan" in parent_text):
-                    score += 40  # Boost Japanese matches
-                    logger.debug(f"  JP match found: {href}")
-                elif region_lower == "pal" and "pal" in parent_text:
-                    score += 35  # PAL in text is good too
-                elif "pal-" not in href_lower and "jp-" not in href_lower:
-                    # No region prefix = NTSC-U (default), slight penalty if searching for other region
-                    score -= 10
-
-            logger.debug(f"  Match candidate: '{link_text}' (score={score}, href={href})")
-
-            if score > best_score and score >= 20:
-                best_score = score
-                best_match = {
-                    "url": href if href.startswith("http") else f"{PRICECHARTING_BASE_URL}{href}",
-                    "title": link.get_text().strip(),
-                }
-
-        if best_match:
-            logger.info(f"Found match: {best_match['title']} -> {best_match['url']}")
-
-        return best_match
+                if region_lower == url_region:
+                    region_score = 1.0  # Exact region match
+                elif region_lower == "pal" and url_region == "":
+                    region_score = 0.3  # PAL searching but found NTSC-U (acceptable fallback)
+                elif region_lower == "" and url_region == "":
+                    region_score = 1.0  # Both NTSC-U
+            else:
+                # No region specified - any region is fine
+                region_score = 0.5
+            
+            # Combined score (title is most important, then region, then platform)
+            total_score = (title_score * 0.5) + (region_score * 0.3) + (platform_score * 0.2)
+            
+            # Build full URL if relative
+            if not game_url.startswith("http"):
+                game_url = f"{PRICECHARTING_BASE_URL}{game_url}"
+            
+            logger.debug(
+                f"  Candidate: '{game_title}' | platform={url_platform} region={url_region} | "
+                f"scores: title={title_score:.2f} region={region_score:.2f} platform={platform_score:.2f} total={total_score:.2f}"
+            )
+            
+            candidates.append({
+                "url": game_url,
+                "title": game_title,
+                "score": total_score,
+                "title_score": title_score,
+                "region_score": region_score,
+                "platform_score": platform_score,
+            })
+        
+        if not candidates:
+            logger.debug("No valid candidates found in search results")
+            return None
+        
+        # Sort by total score, then by title score as tiebreaker
+        candidates.sort(key=lambda x: (x["score"], x["title_score"]), reverse=True)
+        
+        best = candidates[0]
+        
+        # Only accept if we have a reasonable match
+        # Minimum thresholds: title must be at least somewhat similar
+        if best["title_score"] < 0.3:
+            logger.debug(f"Best candidate '{best['title']}' has too low title score: {best['title_score']:.2f}")
+            return None
+        
+        logger.info(f"Found match: '{best['title']}' (score={best['score']:.2f}) -> {best['url']}")
+        
+        return {
+            "url": best["url"],
+            "title": best["title"],
+        }
 
     def _parse_game_page(self, html: str) -> dict:
         """
@@ -566,21 +881,35 @@ class RGPClient:
             search_url = self._build_search_url(item.title, pc_platform, region_str)
             logger.debug(f"Search URL: {search_url}")
 
-            search_html = await self._make_request(search_url)
+            search_html, final_search_url = await self._make_request(search_url)
 
-            # Find game in results (include region for better matching)
-            game_info = self._parse_search_results(search_html, item.title, pc_platform, region_str)
+            # Check if we were redirected directly to a game page (exact match)
+            # This happens when PriceCharting finds an exact match
+            # Check by URL pattern: /game/ means game page, /search means search results
+            if self._is_game_detail_page(final_search_url):
+                logger.info(f"Search redirected directly to game page (exact match): {final_search_url}")
+                game_info = {
+                    "url": final_search_url,
+                    "title": self._extract_game_title_from_page(search_html) or item.title,
+                }
+                # Use the already-fetched HTML for parsing prices (avoid extra request)
+                game_html = search_html
+            else:
+                # We got search results page - parse to find matching game
+                logger.debug(f"Got search results page, parsing for matches...")
+                game_info = self._parse_search_results(search_html, item.title, pc_platform, region_str)
 
-            if not game_info:
-                result.success = False
-                result.error = "Game not found in search results"
-                result.details = f"PriceCharting: No match for '{item.title}' ({item.platform}) [{region_str or 'NTSC-U'}]\nSearched: {search_url}"
-                logger.warning(f"No match found for {item.title} ({item.platform}) [{region_str or 'NTSC-U'}]")
-                return result
+                if not game_info:
+                    result.success = False
+                    result.error = "Game not found in search results"
+                    result.details = f"PriceCharting: No match for '{item.title}' ({item.platform}) [{region_str or 'NTSC-U'}]\nSearched: {search_url}"
+                    logger.warning(f"No match found for {item.title} ({item.platform}) [{region_str or 'NTSC-U'}]")
+                    return result
 
-            # Fetch game detail page
-            logger.debug(f"Fetching game page: {game_info['url']}")
-            game_html = await self._make_request(game_info["url"])
+                # Fetch game detail page
+                logger.info(f"Found in search results: {game_info['title']} - fetching detail page...")
+                game_html, _ = await self._make_request(game_info["url"])
+
             prices = self._parse_game_page(game_html)
 
             if not prices:
@@ -684,7 +1013,7 @@ class RGPClient:
 async def get_rgp_price(
     item: GameItem,
     cache: PriceCache | None = None,
-    sleep_seconds: float = 10.0,
+    sleep_seconds: float = 15.0,
 ) -> PriceResult:
     """
     Convenience function to get price estimate for a game item.
@@ -692,7 +1021,7 @@ async def get_rgp_price(
     Args:
         item: Game item to price
         cache: Optional cache instance
-        sleep_seconds: Rate limit delay
+        sleep_seconds: Rate limit delay (default 15s to avoid 429 errors)
 
     Returns:
         PriceResult with pricing data (prices in USD, not EUR!)
