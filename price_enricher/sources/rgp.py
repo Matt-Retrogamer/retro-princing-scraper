@@ -203,8 +203,12 @@ class RGPClient:
         # Clean up title for search - remove parenthetical notes that hurt search
         clean_title = self._clean_title_for_search(title)
         
+        # Japanese-exclusive platforms - don't add region suffix as it's redundant
+        japan_only_platforms = {"Famicom", "Super Famicom", "PC Engine"}
+        
         # Build search term with platform and optional region
-        if region:
+        # Skip region for Japan-only consoles (they're inherently Japanese)
+        if region and platform not in japan_only_platforms:
             search_term = f"{clean_title} {platform} {region}"
         else:
             search_term = f"{clean_title} {platform}"
@@ -231,7 +235,9 @@ class RGPClient:
         # Base platform mapping
         platform_map = {
             # Nintendo
+            "FC": "Famicom",
             "NES": "NES",
+            "SFC": "Super Famicom",
             "SNES": "Super Nintendo",
             "Super Nintendo": "Super Nintendo",
             "Nintendo 64": "Nintendo 64",
@@ -409,13 +415,17 @@ class RGPClient:
             "3ds": "nintendo-3ds",
             "nintendo-ds": "nintendo-ds",
             "nds": "nintendo-ds",
+            "fc": "famicom",
+            "sfc": "super-famicom",
             "super-nintendo": "super-nintendo",
             "snes": "super-nintendo",
             "nintendo-64": "nintendo-64",
             "n64": "nintendo-64",
             "gamecube": "gamecube",
             "gc": "gamecube",
-            "mega-drive": "sega-genesis",
+            # Note: Mega Drive/Genesis mapping depends on region in _extract_platform_from_url
+            # JP uses "sega-mega-drive", while US/PAL uses "sega-genesis"
+            "mega-drive": "sega-mega-drive",  # Changed to match JP naming
             "genesis": "sega-genesis",
             "sega-genesis": "sega-genesis",
             "playstation": "playstation",
@@ -575,6 +585,10 @@ class RGPClient:
                     platform_score = 1.0
                 elif platform_slug.replace("-", "") in url_platform.replace("-", ""):
                     platform_score = 0.9
+                # Special case: Mega Drive and Genesis are the same console
+                elif (platform_slug in ("sega-mega-drive", "sega-genesis") and 
+                      url_platform in ("sega-mega-drive", "sega-genesis")):
+                    platform_score = 1.0
                 # Also check console text
                 elif platform_slug.replace("-", " ") in console_text:
                     platform_score = 0.8
@@ -626,6 +640,11 @@ class RGPClient:
         # Minimum thresholds: title must be at least somewhat similar
         if best["title_score"] < 0.3:
             logger.debug(f"Best candidate '{best['title']}' has too low title score: {best['title_score']:.2f}")
+            return None
+        
+        # Platform must also match reasonably well (reject completely wrong platforms)
+        if best["platform_score"] < 0.5:
+            logger.debug(f"Best candidate '{best['title']}' has wrong platform (score={best['platform_score']:.2f})")
             return None
         
         logger.info(f"Found match: '{best['title']}' (score={best['score']:.2f}) -> {best['url']}")
