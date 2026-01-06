@@ -16,17 +16,27 @@ Enrich video game collection CSV with online price estimates from eBay (sold lis
 
 ### 1. Install Dependencies
 
-```bash
-# Install task runner if you don't have it
-brew install go-task
+First, install [uv](https://docs.astral.sh/uv/) if you don't have it:
 
-# Setup project
-task setup
+```bash
+# macOS/Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Or with Homebrew
+brew install uv
+
+# Or with pip
+pip install uv
 ```
 
-Or manually with uv:
+Then install project dependencies:
 
 ```bash
+# With task runner (optional)
+brew install go-task
+task setup
+
+# Or directly with uv
 uv sync --all-extras
 ```
 
